@@ -271,6 +271,16 @@ jl_value_t *skip_meta(jl_array_t *body);
 int has_meta(jl_array_t *body, jl_sym_t *sym);
 
 // backtraces
+typedef struct {
+    char *func_name;
+    char *file_name;
+    int line;
+    jl_lambda_info_t *linfo;
+    jl_value_t *specSig;
+    int fromC;
+    int inlined;
+} jl_frame_t;
+
 uint64_t jl_getUnwindInfo(uint64_t dwBase);
 #ifdef _OS_WINDOWS_
 extern HANDLE hMainThread;
@@ -297,9 +307,7 @@ size_t rec_backtrace_ctx_dwarf(intptr_t *data, size_t maxsize, bt_context_t ctx)
 #endif
 JL_DLLEXPORT void jl_raise_debugger(void);
 // Set *name and *filename to either NULL or malloc'd string
-void jl_getFunctionInfo(char **name, char **filename, size_t *line,
-                        char **inlinedat_file, size_t *inlinedat_line, jl_lambda_info_t **outer_linfo,
-                        uintptr_t pointer, int *fromC, int skipC, int skipInline);
+int jl_getFunctionInfo(jl_frame_t **frames, uintptr_t pointer, int skipC);
 JL_DLLEXPORT void jl_gdblookup(intptr_t ip);
 
 // *to is NULL or malloc'd pointer, from is allowed to be NULL

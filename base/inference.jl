@@ -1857,6 +1857,7 @@ function typeinf_uncached(linfo::LambdaInfo, atypes::ANY, sparams::SimpleVector,
         if optimize
             if JLOptions().can_inline == 1
                 fulltree.args[3] = inlining_pass(fulltree.args[3], sv, fulltree)[1]
+
                 # inlining can add variables
                 sv.vars = append_any(f_argnames(fulltree), map(vi->vi[1], fulltree.args[2][1]))
                 inbounds_meta_elim_pass(fulltree.args[3])
@@ -2718,14 +2719,14 @@ function inlineable(f::ANY, ft::ANY, e::Expr, atype::ANY, sv::VarInfo, enclosing
         expr = lastexpr.args[1]
     end
 
-    if length(stmts) == 1
-        # remove line number when inlining a single expression. see issue #13725
-        s = stmts[1]
-        if isa(s,Expr)&&is(s.head,:line) || isa(s,LineNumberNode)
-            pop!(stmts)
-        end
+   if length(stmts) >= 0
+       if length(stmts) == 1 && (isa(stmts[1],Expr) && stmts[1].head === :line || isa(stmts[1], LineNumberNode))
+           empty!(stmts)
+       else
+           unshift!(stmts,Expr(:meta, :push_lambda, linfo, atypes))
+           push!(stmts, Expr(:meta, :pop_lambda))
+       end
     end
-
     if !isempty(stmts) && !propagate_inbounds
         # inlined statements are out-of-bounds by default
         unshift!(stmts, Expr(:inbounds, false))

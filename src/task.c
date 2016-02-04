@@ -488,19 +488,20 @@ static void init_task(jl_task_t *t, char *stack)
 #endif /* !COPY_STACKS */
 
 // Always Set *func_name and *file_name to malloc'd pointers (non-NULL)
-static int frame_info_from_ip(char **func_name,
-                              char **file_name, size_t *line_num,
-                              char **inlinedat_file, size_t *inlinedat_line,
-                              jl_lambda_info_t **outer_linfo,
-                              size_t ip, int skipC, int skipInline)
+static int frame_info_from_ip(size_t ip, int skipC)
 {
     // This function is not allowed to reference any TLS variables since
     // it can be called from an unmanaged thread on OSX.
-    static const char *name_unknown = "???";
+    /*    static const char *name_unknown = "???";
     int fromC = 0;
-
-    jl_getFunctionInfo(func_name, file_name, line_num, inlinedat_file, inlinedat_line, outer_linfo,
-            ip, &fromC, skipC, skipInline);
+    jl_frame_t *frames;
+    jl_getFunctionInfo(&frames, ip, skipC);
+    *func_name = frames[0].func_name;
+    *file_name = frames[0].file_name;
+    *line_num = frames[0].line;
+    *outer_linfo = frames[0].linfo;
+    *inlinedat_file = NULL;
+    *inlinedat_line = NULL;
     if (!*func_name) {
         *func_name = strdup(name_unknown);
         *line_num = ip;
@@ -508,7 +509,7 @@ static int frame_info_from_ip(char **func_name,
     if (!*file_name) {
         *file_name = strdup(name_unknown);
     }
-    return fromC;
+    return fromC;*/
 }
 
 #if defined(_OS_WINDOWS_)
@@ -732,30 +733,33 @@ JL_DLLEXPORT jl_value_t *jl_backtrace_from_here(void)
 
 JL_DLLEXPORT jl_value_t *jl_lookup_code_address(void *ip, int skipC)
 {
-    char *func_name;
-    size_t line_num;
-    char *file_name;
-    size_t inlinedat_line;
-    char *inlinedat_file;
-    jl_lambda_info_t *outer_linfo;
-    int fromC = frame_info_from_ip(&func_name, &file_name, &line_num,
-                                   &inlinedat_file, &inlinedat_line, &outer_linfo,
-                                   (size_t)ip, skipC, 0);
-    jl_value_t *r = (jl_value_t*)jl_alloc_svec(8);
-    JL_GC_PUSH1(&r);
-    jl_svecset(r, 0, jl_symbol(func_name));
-    jl_svecset(r, 1, jl_symbol(file_name));
-    jl_svecset(r, 2, jl_box_long(line_num));
-    jl_svecset(r, 3, jl_symbol(inlinedat_file ? inlinedat_file : ""));
-    jl_svecset(r, 4, jl_box_long(inlinedat_file ? inlinedat_line : -1));
-    jl_svecset(r, 5, outer_linfo != NULL ? (jl_value_t*)outer_linfo : jl_nothing);
-    jl_svecset(r, 6, jl_box_bool(fromC));
-    jl_svecset(r, 7, jl_box_long((intptr_t)ip));
-    free(func_name);
-    free(file_name);
-    free(inlinedat_file);
+    jl_frame_t *frames = NULL;
+    int n = jl_getFunctionInfo(&frames, ip, skipC);
+    jl_value_t *rs = (jl_value_t*)jl_alloc_svec(n);
+    JL_GC_PUSH1(&rs);
+    for (int i = 0; i < n; i++) {
+        jl_frame_t frame = frames[i];
+        jl_value_t *r = (jl_value_t*)jl_alloc_svec(8);
+        jl_svecset(rs, i, r);
+        if (frame.func_name)
+            jl_svecset(r, 0, jl_symbol(frame.func_name));
+        else
+            jl_svecset(r, 0, jl_symbol("???"));
+        free(frame.func_name);
+        if (frame.file_name)
+            jl_svecset(r, 1, jl_symbol(frame.file_name));
+        else
+            jl_svecset(r, 1, jl_symbol("???"));
+        free(frame.file_name);
+        jl_svecset(r, 2, jl_box_long(frame.line));
+        jl_svecset(r, 3, frame.linfo != NULL ? (jl_value_t*)frame.linfo : jl_nothing);
+        jl_svecset(r, 4, frame.specSig != NULL ? frame.specSig : jl_nothing);
+        jl_svecset(r, 5, jl_box_bool(frame.fromC));
+        jl_svecset(r, 6, jl_box_bool(frame.inlined));
+        jl_svecset(r, 7, jl_box_long((intptr_t)ip));
+    }
     JL_GC_POP();
-    return r;
+    return rs;
 }
 
 JL_DLLEXPORT jl_value_t *jl_get_backtrace(void)
@@ -778,15 +782,9 @@ JL_DLLEXPORT void jl_gdblookup(intptr_t ip)
 {
     // This function is not allowed to reference any TLS variables since
     // it can be called from an unmanaged thread on OSX.
-    char *func_name;
-    size_t line_num;
-    char *file_name;
-    size_t inlinedat_line;
-    char *inlinedat_file;
-    jl_lambda_info_t *outer_linfo;
-    frame_info_from_ip(&func_name, &file_name, &line_num,
+    /*frame_info_from_ip(&func_name, &file_name, &line_num,
             &inlinedat_file, &inlinedat_line, &outer_linfo, ip,
-            /* skipC */ 0, /* skipInline */ 0);
+             skipC  0, skipInline 0);
     if (line_num == ip) {
         jl_safe_printf("unknown function (ip: %p)\n", (void*)ip);
     }
@@ -810,7 +808,7 @@ JL_DLLEXPORT void jl_gdblookup(intptr_t ip)
     }
     free(func_name);
     free(file_name);
-    free(inlinedat_file);
+    free(inlinedat_file);*/
 }
 
 JL_DLLEXPORT void jlbacktrace(void)

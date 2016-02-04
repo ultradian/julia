@@ -545,74 +545,86 @@ JITEventListener *CreateJuliaJITEventListener()
     return jl_jit_events;
 }
 
-// *name and *filename are either NULL or malloc'd pointers
-static void lookup_pointer(DIContext *context, char **name, size_t *line,
-                           char **filename, size_t *inlinedat_line,
-                           char **inlinedat_file, size_t pointer,
-                           int demangle, int *fromC)
+// *frames is a one element array containing whatever we could come up
+// with for the current frame. here we'll try to expand it using debug info
+// func_name and file_name are either NULL or malloc'd pointers
+static int lookup_pointer(DIContext *context, jl_frame_t **frames,
+                           size_t pointer, int demangle)
 {
     // This function is not allowed to reference any TLS variables since
     // it can be called from an unmanaged thread on OSX.
     DILineInfo info, topinfo;
     DIInliningInfo inlineinfo;
-    if (demangle && *name != NULL) {
-        char *oldname = *name;
-        *name = jl_demangle(*name);
-        free(oldname);
+    if (!context) {
+        if (demangle && (*frames)[0].func_name != NULL) {
+            char *oldname = (*frames)[0].func_name;
+            (*frames)[0].func_name = jl_demangle(oldname);
+            free(oldname);
+        }
+        return 1;
     }
 #ifdef LLVM35
-    DILineInfoSpecifier infoSpec(DILineInfoSpecifier::FileLineInfoKind::AbsoluteFilePath,
-                                 DILineInfoSpecifier::FunctionNameKind::ShortName);
     DILineInfoSpecifier inlineSpec(DILineInfoSpecifier::FileLineInfoKind::AbsoluteFilePath,
                                  DILineInfoSpecifier::FunctionNameKind::ShortName);
 #else
-    int infoSpec = DILineInfoSpecifier::FileLineInfo |
-                   DILineInfoSpecifier::AbsoluteFilePath |
-                   DILineInfoSpecifier::FunctionName;
     int inlineSpec = DILineInfoSpecifier::FileLineInfo |
                    DILineInfoSpecifier::AbsoluteFilePath |
                    DILineInfoSpecifier::FunctionName;
 #endif
 
-    if (context == NULL) goto done;
-    info = context->getLineInfoForAddress(pointer, infoSpec);
-    inlineinfo = context->getInliningInfoForAddress(pointer, inlineSpec);
+    auto inlineInfo = context->getInliningInfoForAddress(pointer, inlineSpec);
 
-#ifndef LLVM35 // LLVM <= 3.4
-    if (strcmp(info.getFunctionName(), "<invalid>") == 0) goto done;
-    if (demangle) {
-        free(*name);
-        *name = jl_demangle(info.getFunctionName());
-    }
-    else {
-        jl_copy_str(name, info.getFunctionName());
-    }
-    *line = info.getLine();
-    jl_copy_str(filename, info.getFileName());
+    int fromC = (*frames)[0].fromC;
+    int n_frames = inlineInfo.getNumberOfFrames();
+    std::vector<jl_lambda_info_t*> inlined_lambdas;
+    std::vector<jl_value_t*> inlined_specsigs;
+    if (n_frames > 1) {
+        jl_frame_t *new_frames = (jl_frame_t*)calloc(sizeof(jl_frame_t), n_frames);
+        memcpy(&new_frames[n_frames-1], *frames, sizeof(jl_frame_t));
+        free(*frames);
+        *frames = new_frames;
 
-    if (inlineinfo.getNumberOfFrames() > 1) {
-        topinfo = inlineinfo.getFrame(inlineinfo.getNumberOfFrames() - 1);
-        jl_copy_str(inlinedat_file, topinfo.getFileName());
-        *inlinedat_line = topinfo.getLine();
+        jl_lambda_info_t *outer_linfo = (*frames)[n_frames-1].linfo;
+        if (outer_linfo) {
+            jl_value_t *ast = outer_linfo->ast;
+            if (!jl_is_expr(ast))
+                ast = jl_uncompress_ast(outer_linfo, ast);
+            jl_expr_t *body = jl_lam_body((jl_expr_t*)ast);
+            for (size_t i = 0; i < jl_array_len(body->args); i++) {
+                jl_value_t *stmt = jl_cellref(body->args, i);
+                if (jl_is_expr(stmt)) {
+                    jl_expr_t *e = (jl_expr_t*)stmt;
+                    if (e->head == meta_sym && jl_cellref(e->args, 0) == (jl_value_t*)jl_symbol("push_lambda")) {
+                        inlined_lambdas.push_back((jl_lambda_info_t*)jl_cellref(e->args, 1));
+                        inlined_specsigs.push_back(jl_cellref(e->args, 2));
+                    }
+                }
+            }
+        }
     }
-#else
-    if (strcmp(info.FunctionName.c_str(), "<invalid>") == 0) goto done;
-    jl_copy_str(name, info.FunctionName.c_str());
-    *line = info.Line;
-    jl_copy_str(filename, info.FileName.c_str());
 
-    if (inlineinfo.getNumberOfFrames() > 1) {
-        topinfo = inlineinfo.getFrame(inlineinfo.getNumberOfFrames() - 1);
-        jl_copy_str(inlinedat_file, topinfo.FileName.c_str());
-        *inlinedat_line = topinfo.Line;
+    for (size_t i = 0; i < n_frames; i++) {
+        auto info = inlineInfo.getFrame(i);
+        jl_frame_t *frame = &(*frames)[i];
+        std::string func_name(info.FunctionName);
+        std::size_t semi_pos = func_name.find(';');
+        if (semi_pos != std::string::npos) {
+            int inl_idx = std::stoi(func_name.substr(semi_pos+1, std::string::npos));
+            func_name = func_name.substr(0, semi_pos);
+            if (inl_idx >= 0 && inl_idx < inlined_lambdas.size()) {
+                frame->linfo = inlined_lambdas[inl_idx];
+                frame->specSig = inlined_specsigs[inl_idx];
+            }
+        }
+        jl_copy_str(&frame->func_name, func_name.c_str());
+        frame->line = info.Line;
+        jl_copy_str(&frame->file_name, info.FileName.c_str());
+        if (i != n_frames - 1) {
+            frame->inlined = 1;
+            frame->fromC = fromC;
+        }
     }
-#endif
-
-done:
-    // If this is a jlcall or jlcapi wrapper, set fromC to match JIT behavior
-    if (*name == NULL || !strncmp(*name, "jlcall_", 7) || !strncmp(*name, "jlcapi_", 7)) {
-        *fromC = true;
-    }
+    return n_frames;
 }
 
 #ifdef _OS_DARWIN_
@@ -679,17 +691,16 @@ extern "C" void jl_register_fptrs(uint64_t sysimage_base, void **fptrs, jl_lambd
 }
 
 // *name and *filename should be either NULL or malloc'd pointer
-static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
-                                    char **inlinedat_file, size_t *inlinedat_line, jl_lambda_info_t **outer_linfo,
-                                    size_t pointer, int *fromC, int skipC, int skipInline)
+static int jl_getDylibFunctionInfo(jl_frame_t **frames, size_t pointer, int skipC)
 {
     // This function is not allowed to reference any TLS variables since
     // it can be called from an unmanaged thread on OSX.
+    jl_frame_t *frame0 = (*frames);
 #ifdef _OS_WINDOWS_
     IMAGEHLP_MODULE64 ModuleInfo;
     BOOL isvalid;
     if (jl_in_stackwalk) {
-        *fromC = 1;
+        frame0->fromC = 1;
         return;
     }
     ModuleInfo.SizeOfStruct = sizeof(IMAGEHLP_MODULE64);
@@ -699,9 +710,9 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
     if (isvalid) {
         char *fname = ModuleInfo.LoadedImageName;
         DWORD64 fbase = ModuleInfo.BaseOfImage;
-        *fromC = (fbase != jl_sysimage_base);
-        if (skipC && *fromC) {
-            return;
+        frame0->fromC = (fbase != jl_sysimage_base);
+        if (skipC && frame0->fromC) {
+            return 1;
         }
         static char frame_info_func[
             sizeof(SYMBOL_INFO) +
@@ -718,7 +729,7 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
         if (SymFromAddr(GetCurrentProcess(), dwAddress, &dwDisplacement64,
                         pSymbol)) {
             // SymFromAddr returned success
-            jl_copy_str(name, pSymbol->Name);
+            jl_copy_str(&frame0->func_name, pSymbol->Name);
             saddr = (void*)(uintptr_t)pSymbol->Address;
         }
         else {
@@ -731,12 +742,12 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
             // SymGetLineFromAddr64 returned success
             // record source file name and line number
             if (frame_info_line.FileName)
-                jl_copy_str(filename, frame_info_line.FileName);
-            *line = frame_info_line.LineNumber;
+                jl_copy_str(frame0->file_name, frame_info_line.FileName);
+            frame0->line = frame_info_line.LineNumber;
         }
-        else if (*fromC) {
+        else if (frame0->fromC) {
             // No debug info, use dll name instead
-            jl_copy_str(filename, fname);
+            jl_copy_str(&frame0->file_name, fname);
         }
         jl_in_stackwalk = 0;
 #else // ifdef _OS_WINDOWS_
@@ -748,13 +759,13 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
 #if defined(_OS_DARWIN_)
         size_t msize = (size_t)(((uint64_t)-1)-fbase);
 #endif
-        *fromC = (fbase != jl_sysimage_base);
-        if (skipC && *fromC)
-            return;
+        frame0->fromC = (fbase != jl_sysimage_base);
+        if (skipC && frame0->fromC)
+            return 1;
         // In case we fail with the debug info lookup, we at least still
         // have the function name, even if we don't have line numbers
-        jl_copy_str(name, dlinfo.dli_sname);
-        jl_copy_str(filename, dlinfo.dli_fname);
+        jl_copy_str(&frame0->func_name, dlinfo.dli_sname);
+        jl_copy_str(&frame0->file_name, dlinfo.dli_fname);
         fname = dlinfo.dli_fname;
 #endif // ifdef _OS_WINDOWS_
         DIContext *context = NULL;
@@ -883,8 +894,6 @@ static void jl_getDylibFunctionInfo(char **name, char **filename, size_t *line,
 #ifdef _OS_DARWIN_
 lookup:
 #endif
-        lookup_pointer(context, name, line, filename, inlinedat_line, inlinedat_file, pointer+slide,
-                       fbase == jl_sysimage_base, fromC);
         if (jl_sysimage_base == fbase && sysimg_fvars) {
 #ifdef _OS_LINUX_
             unw_proc_info_t pip;
@@ -895,32 +904,31 @@ lookup:
             if (saddr) {
                 for (size_t i = 0; i < sysimg_fvars_n; i++) {
                     if (saddr == sysimg_fvars[i]) {
-                        *outer_linfo = sysimg_fvars_linfo[i];
+                        frame0->linfo = sysimg_fvars_linfo[i];
                         break;
                     }
                 }
             }
         }
+        return lookup_pointer(context, frames, pointer+slide,
+                              fbase == jl_sysimage_base);
     }
     else {
-        *fromC = 1;
+        frame0->fromC = 1;
     }
+    return 1;
 }
 
 // Set *name and *filename to either NULL or malloc'd string
-void jl_getFunctionInfo(char **name, char **filename, size_t *line,
-                        char **inlinedat_file, size_t *inlinedat_line, jl_lambda_info_t **outer_linfo,
-                        size_t pointer, int *fromC, int skipC, int skipInline)
+int jl_getFunctionInfo(jl_frame_t **frames_out, size_t pointer, int skipC)
 {
     // This function is not allowed to reference any TLS variables since
     // it can be called from an unmanaged thread on OSX.
-    *name = NULL;
-    *line = -1;
-    *filename = NULL;
-    *inlinedat_file = NULL;
-    *inlinedat_line = -1;
-    *outer_linfo = NULL;
-    *fromC = 0;
+
+    // initial guess
+    int n_frames = 1;
+    jl_frame_t *frames = (jl_frame_t*)calloc(sizeof(jl_frame_t), 1);
+    frames[0].line = -1;
 
 #ifdef USE_MCJIT
     // With MCJIT we can get function information directly from the ObjectFile
@@ -930,9 +938,9 @@ void jl_getFunctionInfo(char **name, char **filename, size_t *line,
 
     if (it != objmap.end() &&
         (intptr_t)(*it).first + (*it).second.size > pointer) {
-        *outer_linfo = (*it).second.linfo;
+        frames[0].linfo = (*it).second.linfo;
 #if defined(_OS_DARWIN_) && !defined(LLVM37)
-        *name = jl_demangle((*it).second.name);
+        frames[0].func_name = jl_demangle((*it).second.name);
         DIContext *context = NULL; // versions of MCJIT < 3.7 can't handle MachO relocations
 #else
 #ifdef LLVM36
@@ -946,7 +954,8 @@ void jl_getFunctionInfo(char **name, char **filename, size_t *line,
         DIContext *context = DIContext::getDWARFContext(const_cast<object::ObjectFile*>(it->second.object));
 #endif
 #endif
-        lookup_pointer(context, name, line, filename, inlinedat_line, inlinedat_file, pointer, 1, fromC);
+        *frames_out = frames;
+        n_frames = lookup_pointer(context, frames_out,  pointer, 1);
         delete context;
     }
 
@@ -960,21 +969,21 @@ void jl_getFunctionInfo(char **name, char **filename, size_t *line,
         if (skipC && (*it).second.lines.empty()) {
             // Technically not true, but we don't want them
             // in julia backtraces, so close enough
-            *fromC = 1;
+            frames[0].fromC = 1;
             uv_rwlock_rdunlock(&threadsafe);
             return;
         }
 
-        jl_copy_str(name, (*it).second.func->getName().str().c_str());
-        jl_copy_str(filename, "");
+        jl_copy_str(&frames[0].func_name, (*it).second.func->getName().str().c_str());
+        jl_copy_str(&frames[0].file_name, "");
 
         if ((*it).second.lines.empty()) {
-            *fromC = 1;
+            frames[0].fromC = 1;
             uv_rwlock_rdunlock(&threadsafe);
             return;
         }
 
-        *outer_linfo = (*it).second.linfo;
+        frames[0].linfo = (*it).second.linfo;
         std::vector<JITEvent_EmittedFunctionDetails::LineStart>::iterator vit =
             (*it).second.lines.begin();
         JITEvent_EmittedFunctionDetails::LineStart prev = *vit;
@@ -982,16 +991,16 @@ void jl_getFunctionInfo(char **name, char **filename, size_t *line,
         if ((*it).second.func) {
             DISubprogram debugscope =
                 DISubprogram(prev.Loc.getScope((*it).second.func->getContext()));
-            jl_copy_str(filename, debugscope.getFilename().str().c_str());
+            jl_copy_str(&frames[0].file_name, debugscope.getFilename().str().c_str());
             // the DISubprogram has the un-mangled name, so use that if
             // available. However, if the scope need not be the current
             // subprogram.
             if (debugscope.getName().data() != NULL) {
-                jl_copy_str(name, debugscope.getName().str().c_str());
+                jl_copy_str(&frames[0].func_name, debugscope.getName().str().c_str());
             }
             else {
-                char *oldname = *name;
-                *name = jl_demangle(*name);
+                char *oldname = frames[0].func_name;
+                frames[0].func_name = jl_demangle(frames[0].func_name);
                 free(oldname);
             }
         }
@@ -1000,34 +1009,30 @@ void jl_getFunctionInfo(char **name, char **filename, size_t *line,
 
         while (vit != (*it).second.lines.end()) {
             if (pointer <= (*vit).Address) {
-                *line = prev.Loc.getLine();
+                frames[0].line = prev.Loc.getLine();
                 break;
             }
             prev = *vit;
             vit++;
         }
-        if (*line == (size_t) -1) {
-            *line = prev.Loc.getLine();
+        if (frames[0].line == (size_t) -1) {
+            frames[0].line = prev.Loc.getLine();
         }
 
         DILexicalBlockFile locscope = DILexicalBlockFile(prev.Loc.getScope((*it).second.func->getContext()));
-        jl_copy_str(filename, locscope.getFilename().str().c_str());
+        jl_copy_str(&frames[0].file_name, locscope.getFilename().str().c_str());
 
-        MDNode *inlinedAt = skipInline ? NULL : prev.Loc.getInlinedAt((*it).second.func->getContext());
-        if ((!skipInline) && (inlinedAt != NULL)) {
-            DebugLoc inlineloc = DebugLoc::getFromDILocation(inlinedAt);
-            DILexicalBlockFile inlinescope = DILexicalBlockFile(inlineloc.getScope((*it).second.func->getContext()));
-            jl_copy_str(inlinedat_file, inlinescope.getFilename().str().c_str());
-            *inlinedat_line = inlineloc.getLine();
-        }
+        *frames_out = frames;
     }
 #endif // USE_MCJIT
 
     else {
-        jl_getDylibFunctionInfo(name, filename, line, inlinedat_file, inlinedat_line, outer_linfo, pointer, fromC, skipC, skipInline);
+        *frames_out = frames;
+        n_frames = jl_getDylibFunctionInfo(frames_out, pointer, skipC);
     }
 
     uv_rwlock_rdunlock(&threadsafe);
+    return n_frames;
 }
 
 int jl_get_llvmf_info(uint64_t fptr, uint64_t *symsize, uint64_t *slide,
