@@ -9,9 +9,9 @@ end
 const ERROR_ENVVAR_NOT_FOUND = UInt32(203)
 _getenvlen(var::AbstractString) = ccall(:GetEnvironmentVariableW,stdcall,UInt32,(Cwstring,Ptr{UInt8},UInt32),var,C_NULL,0)
 _hasenv(s::AbstractString) = _getenvlen(s)!=0 || Libc.GetLastError()!=ERROR_ENVVAR_NOT_FOUND
-function _jl_win_getenv(s::UTF16String,len::UInt32)
-    val=zeros(UInt16,len)
-    ret=ccall(:GetEnvironmentVariableW,stdcall,UInt32,(Cwstring,Ptr{UInt16},UInt32),s,val,len)
+function _jl_win_getenv(s::UTF16String, len::UInt32)
+    val = zeros(UInt16,len)
+    ret = ccall(:GetEnvironmentVariableW,stdcall,UInt32,(Cwstring,Ptr{UInt16},UInt32),s,val,len)
     if (ret == 0 && len != 1) || ret != len-1 || val[end] != 0
         error(string("getenv: ", s, ' ', len, "-1 != ", ret, ": ", Libc.FormatMessage()))
     end
@@ -21,7 +21,7 @@ end
 
 macro accessEnv(var,errorcase)
     @unix_only return quote
-         val=_getenv($(esc(var)))
+         val = _getenv($(esc(var)))
          if val == C_NULL
             $(esc(errorcase))
          end
@@ -29,7 +29,7 @@ macro accessEnv(var,errorcase)
     end
     @windows_only return quote
         let var = utf16($(esc(var)))
-            len=_getenvlen(var)
+            len = _getenvlen(var)
             if len == 0
                 if Libc.GetLastError() != ERROR_ENVVAR_NOT_FOUND
                     return utf8("")
@@ -81,14 +81,7 @@ get(::EnvHash, k::AbstractString, def) = @accessEnv k (return def)
 in(k::AbstractString, ::KeyIterator{EnvHash}) = _hasenv(k)
 pop!(::EnvHash, k::AbstractString) = (v = ENV[k]; _unsetenv(k); v)
 pop!(::EnvHash, k::AbstractString, def) = haskey(ENV,k) ? pop!(ENV,k) : def
-function delete!(::EnvHash, k::AbstractString)
-    warn_once("""
-        delete!(ENV,key) now returns the modified environment.
-        Use pop!(ENV,key) to retrieve the value instead.
-        """)
-    _unsetenv(k)
-    ENV
-end
+delete!(::EnvHash, k::AbstractString) = (_unsetenv(k); ENV)
 delete!(::EnvHash, k::AbstractString, def) = haskey(ENV,k) ? delete!(ENV,k) : def
 setindex!(::EnvHash, v, k::AbstractString) = _setenv(k,string(v))
 push!(::EnvHash, k::AbstractString, v) = setindex!(ENV, v, k)
@@ -114,7 +107,7 @@ end
 @windows_only begin
 start(hash::EnvHash) = (pos = ccall(:GetEnvironmentStringsW,stdcall,Ptr{UInt16},()); (pos,pos))
 function done(hash::EnvHash, block::Tuple{Ptr{UInt16},Ptr{UInt16}})
-    if unsafe_load(block[1])==0
+    if unsafe_load(block[1]) == 0
         ccall(:FreeEnvironmentStringsW,stdcall,Int32,(Ptr{UInt16},),block[2])
         return true
     end
@@ -155,12 +148,12 @@ function withenv{T<:AbstractString}(f::Function, keyvals::Pair{T}...)
     old = Dict{T,Any}()
     for (key,val) in keyvals
         old[key] = get(ENV,key,nothing)
-        val !== nothing ? (ENV[key]=val) : _unsetenv(key)
+        val !== nothing ? (ENV[key]=val) : delete!(ENV, key)
     end
     try f()
     finally
         for (key,val) in old
-            val !== nothing ? (ENV[key]=val) : _unsetenv(key)
+            val !== nothing ? (ENV[key]=val) : delete!(ENV, key)
         end
     end
 end
