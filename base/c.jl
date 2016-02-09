@@ -91,6 +91,13 @@ function unsafe_convert(::Type{Cstring}, s::ByteString)
     return Cstring(p)
 end
 
+function unsafe_convert(::Type{Cwstring}, s::Vector{Cwchar_t})
+    if 0 in s
+        throw(ArgumentError("embedded NUL bytes are not allowed in C string data: $(repr(s))"))
+    end
+    return Cwstring(pointer(s))
+end
+
 # symbols are guaranteed not to contain embedded NUL
 convert(::Type{Cstring}, s::Symbol) = Cstring(unsafe_convert(Ptr{Cchar}, s))
 
