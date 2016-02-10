@@ -8,7 +8,9 @@ end
 @windows_only begin
 const ERROR_ENVVAR_NOT_FOUND = UInt32(203)
 _getenvlen(var::Vector{UInt16}) = ccall(:GetEnvironmentVariableW,stdcall,UInt32,(Cwstring,Ptr{UInt8},UInt32),var,C_NULL,0)
-_hasenv(s::AbstractString) = _getenvlen(s)!=0 || Libc.GetLastError()!=ERROR_ENVVAR_NOT_FOUND
+_hasenv(s::Vector{UInt16}) = _getenvlen(s) != 0 || Libc.GetLastError() != ERROR_ENVVAR_NOT_FOUND
+_hasenv(s::AbstractString) = _hasenv(utf8to16(bytestring(s).data))
+
 function _jl_win_getenv(s::Vector{UInt16}, len::UInt32)
     val = zeros(UInt16,len)
     ret = ccall(:GetEnvironmentVariableW,stdcall,UInt32,(Cwstring,Ptr{UInt16},UInt32),s,val,len)
