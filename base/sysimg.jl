@@ -314,7 +314,7 @@ function __init__()
 end
 
 include = include_from_node1
-include("precompile.jl")
+# include("precompile.jl")
 
 end # baremodule Base
 
