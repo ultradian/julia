@@ -301,7 +301,7 @@ include("docs/basedocs.jl")
 
 # threads
 include("threads.jl")
-include("threadcall.jl")
+# include("threadcall.jl")
 
 function __init__()
     # Base library init
@@ -310,7 +310,7 @@ function __init__()
     early_init()
     init_load_path()
     init_parallel()
-    init_threadcall()
+    # init_threadcall()
 end
 
 include = include_from_node1
